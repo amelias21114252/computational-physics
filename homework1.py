@@ -8,28 +8,12 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.interpolate import CubicSpline
-from scipy.integrate import quad
+from scipy.ndimage import median_filter
 
 ROOT = Path(__file__).resolve().parent
 FIG = ROOT / "figures"; RES = ROOT / "results"
 FIG.mkdir(exist_ok=True); RES.mkdir(exist_ok=True)
-# Locate the supplied matter-power-spectrum file in the same folder as this script.
-# This supports the original download name (lcdm_z0(1).matter_pk) as well as
-# cleaner GitHub names such as lcdm_z0.matter_pk.
-def find_data_file():
-    preferred = [ROOT / "lcdm_z0.matter_pk", ROOT / "lcdm_z0(1).matter_pk"]
-    for path in preferred:
-        if path.exists():
-            return path
-    matches = sorted(ROOT.glob("lcdm_z0*.matter_pk"))
-    if matches:
-        return matches[0]
-    raise FileNotFoundError(
-        "Could not find the matter power spectrum. Put lcdm_z0(1).matter_pk "
-        "or lcdm_z0.matter_pk in the same folder as this Python script."
-    )
-
-DATA = find_data_file()
+DATA = ROOT / "lcdm_z0.matter_pk"
 
 EPS32 = np.finfo(np.float32).eps
 
@@ -46,41 +30,73 @@ def central_difference(f, x, h):
     return np.float32((f(x + h) - f(x - h)) / (np.float32(2.0) * h))
 
 def extrapolated_difference(f, x, h):
-    # Richardson extrapolation of the O(h^2) central difference.
+    # Same fourth-order Richardson formula, parameterized with h and 2h.
     h = np.float32(h)
     d_h = central_difference(f, x, h)
-    d_h2 = central_difference(f, x, h / np.float32(2.0))
-    return np.float32((np.float32(4.0) * d_h2 - d_h) / np.float32(3.0))
+    d_2h = central_difference(f, x, np.float32(2.0) * h)
+    return np.float32((np.float32(4.0) * d_h - d_2h) / np.float32(3.0))
 
 def relerr(approx, exact): return abs(float(approx) - float(exact)) / abs(float(exact))
 
+def fit_truncation_slope(hs, errs, order, optimum_index=None):
+    # Fit the truncation-dominated points to the right of the representative
+    # minimum.  Restricting to errors below 0.2 avoids the far-right region
+    # where higher Taylor terms can spoil the leading-order power law.
+    mask=np.isfinite(errs) & (errs>0) & (errs<0.2)
+    if optimum_index is not None:
+        mask &= np.arange(len(hs)) > optimum_index
+    if np.count_nonzero(mask) < 4:
+        return np.nan
+    return float(np.polyfit(np.log10(hs[mask].astype(float)),np.log10(errs[mask]),1)[0])
+
 def problem1():
-    hs = np.logspace(-7, 0, 141).astype(np.float32)
+    hs = np.logspace(-8, 0, 500).astype(np.float32)
     cases = [("cos", f32_cos, lambda x: -np.sin(x), 0.1),
              ("cos", f32_cos, lambda x: -np.sin(x), 10.0),
              ("exp", f32_exp, np.exp, 0.1),
              ("exp", f32_exp, np.exp, 10.0)]
-    methods = [("Forward", forward_difference), ("Central", central_difference),
-               ("Extrapolated", extrapolated_difference)]
-    rows=[]
+    methods = [("Forward", forward_difference,1),("Central", central_difference,2),
+               ("Extrapolated", extrapolated_difference,4)]
+    rows=[]; all_errors={}
+    for name,f,df,x in cases:
+        exact=float(df(x)); all_errors[(name,x)]={}
+        for label,method,order in methods:
+            errs=np.array([relerr(method(f,x,h),exact) for h in hs],dtype=float)
+            safe=np.where(np.isfinite(errs)&(errs>0),errs,np.nan)
+            filled=np.where(np.isfinite(np.log10(safe)),np.log10(safe),10.0)
+            med=median_filter(filled,size=21,mode='nearest')
+            i=int(np.nanargmin(med)); representative=float(10**med[i])
+            digits=float(-np.log10(representative))
+            slope=fit_truncation_slope(hs,errs,order,i)
+            rows.append((name,x,label,float(hs[i]),representative,digits,slope))
+            all_errors[(name,x)][label]=(errs,i)
+
     fig, axes = plt.subplots(2,2, figsize=(10,8), constrained_layout=True)
     for ax,(name,f,df,x) in zip(axes.flat,cases):
-        exact=float(df(x))
-        for label,method in methods:
-            errs=np.array([relerr(method(f,x,h),exact) for h in hs])
-            positive=np.where(np.isfinite(errs) & (errs>0))[0]
-            i=positive[np.argmin(errs[positive])]
-            rows.append((name,x,label,float(hs[i]),float(errs[i]),float(method(f,x,hs[i])),exact))
-            ax.loglog(hs,errs,label=label)
-            ax.scatter([hs[i]],[errs[i]],s=20)
-        ax.set_title(f"{name}(x) at x = {x:g}")
-        ax.set_xlabel("step size h")
-        ax.set_ylabel("relative error")
+        for label,method,order in methods:
+            errs,_=all_errors[(name,x)][label]; ax.loglog(hs,errs,label=label,lw=1.0)
+        fx = r"\cos x" if name == "cos" else r"e^x"
+        ax.set_title(rf"$f(x)={fx},\quad x={x:g}$"+"\nConnected error curves")
+        ax.set_xlabel(r"Step size $h$"); ax.set_ylabel("Relative error")
         ax.grid(True,which="both",alpha=.25); ax.legend(fontsize=8)
-    fig.suptitle("Single-precision numerical differentiation")
-    fig.savefig(FIG/"problem1_differentiation_errors.png",dpi=220); plt.close(fig)
+    fig.savefig(FIG/"problem1_connected_errors.png",dpi=220); plt.close(fig)
+
+    fig, axes = plt.subplots(2,2, figsize=(10,8), constrained_layout=True)
+    for ax,(name,f,df,x) in zip(axes.flat,cases):
+        for label,method,order in methods:
+            errs,_=all_errors[(name,x)][label]; ax.loglog(hs,errs,'.',ms=1.8,label=label)
+        if name=='exp' and abs(x-0.1)<1e-12:
+            errs,_=all_errors[(name,x)]['Extrapolated']; valid=np.isfinite(errs)&(errs>0)
+            ids=np.where(valid)[0]; j=ids[np.argmin(errs[valid])]
+            ax.scatter([hs[j]],[errs[j]],marker='*',s=90,edgecolors='k',zorder=5,label='Raw minimum')
+        fx = r"\cos x" if name == "cos" else r"e^x"
+        ax.set_title(rf"$f(x)={fx},\quad x={x:g}$"+"\nIndividual error values")
+        ax.set_xlabel(r"Step size $h$"); ax.set_ylabel("Relative error")
+        ax.grid(True,which="both",alpha=.25); ax.legend(fontsize=8)
+    fig.savefig(FIG/"problem1_discrete_errors.png",dpi=220); plt.close(fig)
+
     with open(RES/"problem1_minimum_errors.csv","w") as out:
-        out.write("function,x,method,h_at_min,minimum_relative_error,numerical_derivative,exact_derivative\n")
+        out.write("function,x,method,h_representative,representative_relative_error,reliable_digits,fitted_truncation_slope\n")
         for r in rows: out.write(",".join(map(str,r))+"\n")
     return rows
 
@@ -143,61 +159,65 @@ def problem2():
 def load_power_spectrum():
     d=np.loadtxt(DATA); return d[:,0],d[:,1]
 
-def build_pk_spline(k,P):
-    # log-log cubic spline respects the smooth power-law behavior and positivity.
-    spl=CubicSpline(np.log(k),np.log(P),extrapolate=True)
-    return lambda x: np.exp(spl(np.log(x)))
+def build_logpk_spline(k,P):
+    return CubicSpline(np.log(k),np.log(P),bc_type="natural",extrapolate=False)
 
-def xi_of_r(r, pk, kmin, kmax):
-    # xi = [1/(2 pi^2 r)] integral k P(k) sin(kr) dk.
-    val,_=quad(lambda kk: kk*pk(kk), kmin, kmax, weight="sin", wvar=float(r),
-               epsabs=1e-8,epsrel=1e-7,limit=500,limlst=500)
-    return val/(2.0*np.pi**2*r)
+def simpson_uniform(y, dx):
+    # Composite Simpson rule for an even number of bins.
+    n=len(y)-1
+    if n%2: raise ValueError("Simpson rule requires an even number of bins")
+    return dx/3.0*(y[0]+y[-1]+4.0*np.sum(y[1:-1:2])+2.0*np.sum(y[2:-1:2]))
+
+def xi_curve_simpson(rs,k,P,kmax,N):
+    if N%2: raise ValueError("N must be even")
+    kmin=float(k[0]); kmax=min(float(kmax),float(k[-1]))
+    spline=build_logpk_spline(k,P)
+    u=np.linspace(np.log(kmin),np.log(kmax),N+1)
+    kk=np.exp(u); pp=np.exp(spline(u)); du=u[1]-u[0]
+    base=kk**3*pp
+    xis=[]
+    for r in rs:
+        z=kk*r
+        kernel=np.sinc(z/np.pi) # sin(z)/z
+        xis.append(simpson_uniform(base*kernel,du)/(2*np.pi**2))
+    return np.asarray(xis)
+
+def local_peak(rs,y,rlo=90.0,rhi=120.0):
+    mask=(rs>=rlo)&(rs<=rhi); ids=np.where(mask)[0]
+    i=int(ids[np.argmax(y[mask])]); rg=float(rs[i]); yg=float(y[i])
+    if 0<i<len(rs)-1:
+        c=np.polyfit(rs[i-1:i+2],y[i-1:i+2],2)
+        rp=float(-c[1]/(2*c[0])); yp=float(np.polyval(c,rp))
+    else: rp,yp=rg,yg
+    return i,rg,yg,rp,yp
 
 def problem3():
-    k,P=load_power_spectrum(); pk=build_pk_spline(k,P)
-    rs=np.linspace(50.0,120.0,281)
-    cutoffs=[10.0,30.0,100.0,300.0]
-    curves={}
-    for km in cutoffs:
-        xis=np.array([xi_of_r(r,pk,k[0],km) for r in rs])
-        curves[km]=rs**2*xis
-    y=curves[300.0]
-    # The BAO feature is the broad local bump near ~100 Mpc/h, not the
-    # larger broadband value at the left edge of the requested interval.
-    peak_mask=(rs>=80.0) & (rs<=120.0)
-    peak_idx=np.where(peak_mask)[0]
-    i=int(peak_idx[np.argmax(y[peak_mask])]); rpeak=float(rs[i]); ypeak=float(y[i])
-    # Parabolic three-point refinement of peak location.
-    if 0<i<len(rs)-1:
-        coeff=np.polyfit(rs[i-1:i+2],y[i-1:i+2],2)
-        rpeak=float(-coeff[1]/(2*coeff[0])); ypeak=float(np.polyval(coeff,rpeak))
+    k,P=load_power_spectrum(); rs=np.arange(50.0,120.0+0.05,0.1)
+    final_kmax=100.0; final_N=2**18
+    cutoffs=[3.0,10.0,30.0,100.0]
+    curves={km: rs**2*xi_curve_simpson(rs,k,P,km,final_N) for km in cutoffs}
+    y=curves[final_kmax]
+    _,grid_r,grid_y,rpeak,ypeak=local_peak(rs,y)
+
     fig,ax=plt.subplots(figsize=(7.4,5.2),constrained_layout=True)
-    ax.plot(rs,y,label=r"$r^2\xi(r)$, $k_{\max}=300\,h\,\mathrm{Mpc}^{-1}$")
+    ax.plot(rs,y,label=fr"$r^2\xi(r)$, $k_{{\max}}={final_kmax:g}\,h/\mathrm{{Mpc}}$")
     ax.axvline(rpeak,ls="--",label=f"BAO peak = {rpeak:.2f} Mpc/h")
     ax.scatter([rpeak],[ypeak],zorder=3)
     ax.set_xlabel(r"$r\ [\mathrm{Mpc}/h]$"); ax.set_ylabel(r"$r^2\xi(r)$")
     ax.set_title("Matter correlation function and BAO peak")
     ax.grid(True,alpha=.25); ax.legend()
     fig.savefig(FIG/"problem3_bao_peak.png",dpi=220); plt.close(fig)
-    fig,ax=plt.subplots(figsize=(7.4,5.2),constrained_layout=True)
-    for km in cutoffs: ax.plot(rs,curves[km],label=fr"$k_{{\max}}={km:g}$")
-    ax.set_xlabel(r"$r\ [\mathrm{Mpc}/h]$"); ax.set_ylabel(r"$r^2\xi(r)$")
-    ax.set_title("Upper-limit convergence of the correlation function")
-    ax.grid(True,alpha=.25); ax.legend()
-    fig.savefig(FIG/"problem3_cutoff_convergence.png",dpi=220); plt.close(fig)
-    # P(k) figure showing baryon-wiggle region.
-    fig,ax=plt.subplots(figsize=(7.4,5.2),constrained_layout=True)
-    ax.loglog(k,P); ax.axvspan(0.03,0.3,alpha=.12,label="BAO wiggle region")
-    ax.set_xlabel(r"$k\ [h/\mathrm{Mpc}]$"); ax.set_ylabel(r"$P(k)$")
-    ax.set_title("Input matter power spectrum"); ax.grid(True,which="both",alpha=.25); ax.legend()
-    fig.savefig(FIG/"problem3_power_spectrum.png",dpi=220); plt.close(fig)
-    # cutoff peak table
-    with open(RES/"problem3_cutoff_convergence.csv","w") as out:
-        out.write("kmax,grid_peak_r,peak_r2xi\n")
-        for km in cutoffs:
-            j=int(np.argmax(curves[km])); out.write(f"{km},{rs[j]},{curves[km][j]}\n")
-    return rpeak,ypeak
+
+    conv=[]
+    for km in cutoffs:
+        _,gr,gy,rp,yp=local_peak(rs,curves[km]); conv.append((km,final_N,gr,gy,rp,yp))
+    for N in [2**14,2**16,2**18,2**19]:
+        yy=rs**2*xi_curve_simpson(rs,k,P,final_kmax,N)
+        _,gr,gy,rp,yp=local_peak(rs,yy); conv.append((final_kmax,N,gr,gy,rp,yp))
+    with open(RES/"problem3_convergence.csv","w") as out:
+        out.write("kmax,N,grid_peak_r,grid_peak_r2xi,parabolic_peak_r,parabolic_peak_r2xi\n")
+        for row in conv: out.write(",".join(map(str,row))+"\n")
+    return rpeak,ypeak,conv
 
 def main():
     p1=problem1(); p2=problem2(); p3=problem3()
@@ -206,6 +226,6 @@ def main():
     for r in p1: print(r)
     print("Problem 2 minima:")
     for r in p2[0]: print(r)
-    print("Problem 3 BAO peak: r = %.4f Mpc/h, r^2 xi = %.6g"%p3)
+    print("Problem 3 BAO peak: r = %.4f Mpc/h, r^2 xi = %.6g"%(p3[0],p3[1]))
 
 if __name__ == "__main__": main()
